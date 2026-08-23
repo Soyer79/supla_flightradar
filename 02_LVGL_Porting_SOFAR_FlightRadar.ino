@@ -1,5 +1,10 @@
  ////DEV_BOARD_3.07_!!!!!!!!!!!!!!!!!!!!//////////////
 //screens.h linia 82     lv_obj_t *qr1;//TYLKO TO!!!!
+//lvgl_port_v8.h     #define LVGL_PORT_BUFFER_SIZE                   (LVGL_PORT_DISP_WIDTH * 45)/// obracanie obrazków o wysokości 45 linii
+// w screens.h przed ostatnim endif 
+//#ifndef LV_LAYOUT_NONE
+//#define LV_LAYOUT_NONE 0
+//#endif////
 //wszystkie ui_image_   //TO NIE
      /*.header.always_zero = 0,
        .header.w = 480,
@@ -41,7 +46,6 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <cJSON.h>
-//#include <string.h>
 
 HWCDC USBSerial;
 
@@ -81,6 +85,18 @@ struct TrackedPlane {
 volatile TrackedPlane trackedPlanesList[MAX_TRACKED_PLANES];
 SemaphoreHandle_t flightDataMutex = NULL;
 
+void flight_timer_cb(lv_timer_t* timer) {
+    if (timer == NULL) return;
+    
+    // Wyciągamy wskaźnik na kliknięty przycisk samolotu, który przekazaliśmy w kroku 1
+    lv_obj_t* clicked_plane = (lv_obj_t*)timer->user_data;
+    
+    if (clicked_plane != NULL) {
+        // Dopiero teraz, gdy interfejs stoi w miejscu, odpalamy ciężkie pobieranie danych z sieci
+        loadFlightDetails(clicked_plane);
+    }
+}
+
 void loadFlightDetails(lv_obj_t* obj) {
     if (obj == NULL) return;
 
@@ -91,8 +107,9 @@ void loadFlightDetails(lv_obj_t* obj) {
     }
 
     uintptr_t m = (uintptr_t)lv_obj_get_user_data(obj);
+    if (m >= MAX_TRACKED_PLANES) return; // Zabezpieczenie przed wyjściem za zakres tablicy
     
-    char infoBuffer[384]; 
+    char infoBuffer[512]; // Zwiększony bufor tekstowy, ponieważ nazwy modeli bywają długie
     char altStr[48]   = "brak";
     char speedStr[48] = "brak";
     char trackStr[32] = "brak";
@@ -113,30 +130,25 @@ void loadFlightDetails(lv_obj_t* obj) {
 
     String currentRoute = "Brak danych o trasie";
     String currentAirline = "Nieznana linia / Prywatny";
+    String currentModel = String(typeClean); // Domyślnie ustawiamy krótki typ (np. EC35) jako fallback
     
     USBSerial.println("\n--- DEBUG ENRICHMENT: Odpytywanie bazy adsbdb.com ---");
     USBSerial.print("Pobrany z radaru CALLSIGN: '");
     USBSerial.print(callsignStr);
     USBSerial.println("'");
 
-    // 3. ODPOWIEDŹ NA STATUS 200: Zapytanie TLS z wymuszonym SNI (Konstrukcja bezpieczna przed ucinaniem)
+    // 3. ZAPYTANIE HTTPS: Pobieranie nazw miast oraz pełnej nazwy modelu statku powietrznego
     if (WiFi.status() == WL_CONNECTED && callsignStr.length() > 2 && callsignStr != "UNK") {
         WiFiClientSecure routeClient;
         routeClient.setInsecure(); // Pomijamy bazę CA dla oszczędności pamięci operacyjnej RAM
-        routeClient.setHandshakeTimeout(4000 / 1000); // Wydłużony czas na uścisk TLS przy jednoczesnym ruchu MQTT
+        routeClient.setHandshakeTimeout(4000 / 1000); 
 
         HTTPClient routeHttp;
-        
-        // ROZWIĄZANIE: Łączymy bezpieczne człony tekstowe, aby przeglądarka nie sformatowała tego jako linku
-        String p1 = "https:";
-        String p2 = "//api.";
-        String p3 = "adsbdb.com/v0/callsign/";
-        String routeUrl = p1 + p2 + p3 + callsignStr;
+        String routeUrl = "https://adsbdb.com" + callsignStr;
         
         USBSerial.print("Wysylam zapytanie HTTPS pod adres: ");
         USBSerial.println(routeUrl);
         
-        // WYMUSZENIE SNI: Podanie pełnego stringa URL jako jedynego parametru begin()
         routeHttp.begin(routeClient, routeUrl);
         
         // Nagłówki wymagane przez Cloudflare do autoryzacji klienta IoT
@@ -153,21 +165,27 @@ void loadFlightDetails(lv_obj_t* obj) {
         if (rCode == HTTP_CODE_OK) {
             String payload = routeHttp.getString();
             
-            USBSerial.println("SUROWA ODPOWIEDZ BAZY ADSDB (PAYLOAD):");
-            USBSerial.println(payload);
-            USBSerial.println("--- KONIEC PAYLOADU ---");
-            
-            // --- PARSOWANIE STRUKTURY ZGODNIE Z PAYLOADEM RADARU ---
             cJSON *root = cJSON_Parse(payload.c_str());
             if (root != NULL) {
                 cJSON *responseObj = cJSON_GetObjectItem(root, "response");
                 if (responseObj != NULL) {
                     
-                    // DOPASOWANE: Wejście w obiekt "flightroute"
+                    // --- PARSOWANIE PEŁNEJ NAZWY MODELU SAMOLOTU ---
+                    // Struktura: response -> aircraft -> model
+                    cJSON *aircraftObj = cJSON_GetObjectItem(responseObj, "aircraft");
+                    if (aircraftObj != NULL) {
+                        cJSON *modelObj = cJSON_GetObjectItem(aircraftObj, "model");
+                        if (modelObj != NULL && cJSON_IsString(modelObj) && strlen(modelObj->valuestring) > 0) {
+                            currentModel = String(modelObj->valuestring);
+                            currentModel.trim();
+                        }
+                    }
+
+                    // --- PARSOWANIE TRASY (LUDZKIE NAZWY MIAST) ---
                     cJSON *flightrouteObj = cJSON_GetObjectItem(responseObj, "flightroute");
                     if (flightrouteObj != NULL) {
                         
-                        // A. Odczyt linii: flightroute -> airline -> name
+                        // Odczyt linii lotniczej
                         cJSON *airlineObj = cJSON_GetObjectItem(flightrouteObj, "airline");
                         if (airlineObj != NULL) {
                             cJSON *nameObj = cJSON_GetObjectItem(airlineObj, "name");
@@ -177,42 +195,46 @@ void loadFlightDetails(lv_obj_t* obj) {
                             }
                         }
 
-                        // B. Odczyt lotnisk: flightroute -> origin/destination -> icao_code
+                        // Wyciąganie miast ze struktury origin i destination
                         cJSON *originObj = cJSON_GetObjectItem(flightrouteObj, "origin");
                         cJSON *destObj = cJSON_GetObjectItem(flightrouteObj, "destination");
                         
-                        if (originObj != NULL && destObj != NULL) {
-                            cJSON *origIcao = cJSON_GetObjectItem(originObj, "icao_code"); // ZMIANA: icao_code zamiast icao
-                            cJSON *destIcao = cJSON_GetObjectItem(destObj, "icao_code");   // ZMIANA: icao_code zamiast icao
-                            
-                            if (origIcao != NULL && cJSON_IsString(origIcao) && destIcao != NULL && cJSON_IsString(destIcao)) {
-                                String fromAir = String(origIcao->valuestring);
-                                String toAir = String(destIcao->valuestring);
-                                fromAir.trim();
-                                toAir.trim();
-                                
-                                if (fromAir.length() > 0 && toAir.length() > 0) {
-                                    currentRoute = fromAir + " -> " + toAir;
-                                }
+                        String fromCity = "";
+                        String toCity = "";
+
+                        if (originObj != NULL) {
+                            cJSON *city = cJSON_GetObjectItem(originObj, "municipality");
+                            if (city == NULL || !cJSON_IsString(city) || strlen(city->valuestring) == 0) {
+                                city = cJSON_GetObjectItem(originObj, "name");
+                            }
+                            if (city != NULL && cJSON_IsString(city)) {
+                                fromCity = String(city->valuestring);
+                                fromCity.trim();
                             }
                         }
-                    } else {
-                        USBSerial.println("Diagnostyka cJSON: Brak obiektu 'flightroute' dla tej maszyny.");
+
+                        if (destObj != NULL) {
+                            cJSON *city = cJSON_GetObjectItem(destObj, "municipality");
+                            if (city == NULL || !cJSON_IsString(city) || strlen(city->valuestring) == 0) {
+                                city = cJSON_GetObjectItem(destObj, "name");
+                            }
+                            if (city != NULL && cJSON_IsString(city)) {
+                                toCity = String(city->valuestring);
+                                toCity.trim();
+                            }
+                        }
+
+                        if (fromCity.length() > 0 && toCity.length() > 0) {
+                            currentRoute = fromCity + " -> " + toCity;
+                        } else if (fromCity.length() > 0) {
+                            currentRoute = fromCity + " -> ?";
+                        } else if (toCity.length() > 0) {
+                            currentRoute = "? -> " + toCity;
+                        }
                     }
                 }
-                cJSON_Delete(root); // Czyszczenie pamięci sterty RAM
-            } else {
-                USBSerial.println("Blad: Nie udalo sie sparsowac struktury JSON.");
+                cJSON_Delete(root); 
             }
-            
-            USBSerial.print("Wynik ostateczny -> Linia: ");
-            USBSerial.print(currentAirline);
-            USBSerial.print(" | Trasa: ");
-            USBSerial.println(currentRoute);
-            
-        } else {
-            USBSerial.print("Brak informacji o trasie dla tego lotu. Powod: ");
-            USBSerial.println(routeHttp.errorToString(rCode).c_str());
         }
         routeHttp.end();
     }
@@ -236,22 +258,24 @@ void loadFlightDetails(lv_obj_t* obj) {
             if (trackedPlanesList[m].speed > 0) {
                 snprintf(speedStr, sizeof(speedStr), "%d kt (%d km/h)", trackedPlanesList[m].speed, (int)(trackedPlanesList[m].speed * 1.852f));
             }
-            if (trackedPlanesList[m].track >= 0) {
-                snprintf(trackStr, sizeof(trackStr), "%d deg", trackedPlanesList[m].track); 
+            
+            int cleanTrackValue = (int)trackedPlanesList[m].track;
+            if (cleanTrackValue >= 0) {
+                snprintf(trackStr, sizeof(trackStr), "%d deg", cleanTrackValue); 
             }
 
             snprintf(infoBuffer, sizeof(infoBuffer),
                 "CALLSIGN: %s\n\n"
                 "LINIA: %s\n\n"
                 "TRASA: %s\n\n"
-                "TYP: %s\n\n"
+                "TYP: %s\n\n" // Tutaj wstrzykiwana jest pełna nazwa (np. Eurocopter EC135 / Boeing 737)
                 "ALT: %s\n\n"
                 "GS: %s\n\n"
                 "KURS: %s",
                 callsignStr.c_str(),
                 currentAirline.c_str(),
                 currentRoute.c_str(),
-                typeClean,
+                currentModel.c_str(), 
                 altStr,
                 speedStr,
                 trackStr
@@ -399,6 +423,14 @@ void updateFlightRadarUI() {
         objects.plane6_1, objects.plane7_1, objects.plane8_1, objects.plane9_1, objects.plane10_1
     };
 
+    // Tablica wskaźników do Twoich 4 konkretnych ikon z EEZ Studio
+    const lv_img_dsc_t* planeDirections[4] = {
+        &img_plane,   // Indeks 0: Północ (kursy wokół 0° / 360°)
+        &img_plane1,  // Indeks 1: Wschód (kursy wokół 90°)
+        &img_plane2,  // Indeks 2: Południe (kursy wokół 180°)
+        &img_plane3   // Indeks 3: Zachód (kursy wokół 270°)
+    };
+
     // Odczyt danych z tablicy globalnej pod osłoną TYLKO JEDNEGO Mutexu
     if (flightDataMutex != NULL && xSemaphoreTake(flightDataMutex, pdMS_TO_TICKS(25)) == pdTRUE) {
         
@@ -416,22 +448,31 @@ void updateFlightRadarUI() {
                 // 1. Ustawienie pozycji PRZYCISKU na ekranie radaru
                 lv_obj_set_pos(planeButtons[m], targetX, targetY);
 
-                // 2. BEZPOŚREDNIE POBRANIE OBRAZKA Z TABLICY (Zamiast lv_obj_get_child)
+                // 2. BEZPOŚREDNIE POBRANIE OBRAZKA Z TABLICY
                 lv_obj_t* planeImage = planeImages[m];
 
                 if (planeImage != NULL) {
-                    // Ustawienie punktu obrotu dokładnie na środku ikony 32x32 px
-                    lv_img_set_pivot(planeImage, 16, 16);
+                    // Pobieramy surową wartość kursu (0.0 - 360.0)
+                    float rawTrack = (float)trackedPlanesList[m].track;
 
-                    // Przeliczenie kąta dla LVGL v8 (wartość * 10)
-                    int lvglAngle = (int)(trackedPlanesList[m].track * 10);
+                    // Normalizacja kołowa kąta dla 100% bezpieczeństwa matematycznego
+                    while (rawTrack < 0.0f) rawTrack += 360.0f;
+                    while (rawTrack >= 360.0f) rawTrack -= 360.0f;
+
+                    // MAPOWANIE KĄTA NA 4 STREFY (Dodajemy 45 stopni przesunięcia i dzielimy przez 90)
+                    // Dzięki temu Północ (Index 0) złapie idealnie zakres od 315.0° do 45.0°
+                    int dirIndex = (int)((rawTrack + 45.0f) / 90.0f);
                     
-                    // Normalizacja kąta do zakresu 0 - 3600
-                    if (lvglAngle < 0) lvglAngle += 3600;
-                    lvglAngle = lvglAngle % 3600;
+                    // Jeśli po zaokrągleniu wyjdzie indeks 4, oznacza to powrót na północ (360° -> indeks 0)
+                    if (dirIndex >= 4) {
+                        dirIndex = 0;
+                    }
 
-                    // 3. Obracamy tylko wewnętrzny OBRAZEK
-                    lv_img_set_angle(planeImage, lvglAngle);
+                    // Bezwarunkowa podmiana pliku źródłowego ikony w LVGL 8.3
+                    lv_img_set_src(planeImage, planeDirections[dirIndex]);
+                    
+                    // Wymuszenie odświeżenia całego przycisku
+                    lv_obj_invalidate(planeButtons[m]);
                 }
 
                 // Przypisanie ID indeksu dla struktury kliknięć przycisku
@@ -980,16 +1021,22 @@ void action_akcja(lv_event_t * e){
     }
 if ((obj == objects.plane1)||(obj == objects.plane2)||(obj == objects.plane3)||(obj == objects.plane4)||(obj == objects.plane5)||(obj == objects.plane6)||(obj == objects.plane7)||(obj == objects.plane8)||(obj == objects.plane9)||(obj == objects.plane10))
 {
-    // 1. Wpisujemy tekst oczekiwania na ekranie scr11
+    // 1. Natychmiast wpisujemy tekst oczekiwania na ekranie scr11
     if (objects.lbl_11_dane != NULL) {
         lv_label_set_text(objects.lbl_11_dane, "Pobieranie danych o locie...");
     }
 
-    // 2. Płynnie i spokojnie przechodzimy na ekran scr11 (Animacja trwa 1000 ms + 100 ms opóźnienia)
+    // 2. Płynnie przechodzimy na ekran scr11 (Animacja trwa 1000 ms + 100 ms opóźnienia = łącznie 1100 ms)
     lv_scr_load_anim(objects.scr11, LV_SCR_LOAD_ANIM_OUT_RIGHT, 1000, 100, false);
 
-    // 3. Wywołujemy funkcję, która wewnątrz siebie poczeka na zakończenie tego ruchu
-    loadFlightDetails(obj);
+    // 3. [KLUCZOWY FIX] Tworzymy jednorazowy timer LVGL.
+    // Dajemy mu 1200 ms (1.2 sekundy) czasu. W tym czasie procesor zajmuje się TYLKO rysowaniem pięknej, płynnej animacji.
+    // Przekazujemy kliknięty obiekt (obj) jako user_data dla timera, aby wiedział, który to samolot.
+    lv_timer_t* delayed_flight_timer = lv_timer_create(flight_timer_cb, 1200, (void*)obj);
+    
+    if (delayed_flight_timer != NULL) {
+        lv_timer_set_repeat_count(delayed_flight_timer, 1); // Wykona się dokładnie JEDEN RAZ i sam się skasuje
+    }
 }
   ///////////////////////////////////////flightEND
     if (obj == objects.btn_0_next)
