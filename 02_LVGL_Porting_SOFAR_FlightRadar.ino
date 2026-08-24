@@ -37,6 +37,7 @@
 #include "ui.h"
 #include "actions.h"
 #include "screens.h"
+#include "images.h"
 #include <ESP_IOExpander_Library.h>
 #include "HWCDC.h"
 #include <NetworkClient.h>
@@ -423,12 +424,16 @@ void updateFlightRadarUI() {
         objects.plane6_1, objects.plane7_1, objects.plane8_1, objects.plane9_1, objects.plane10_1
     };
 
-    // Tablica wskaźników do Twoich 4 konkretnych ikon z EEZ Studio
-    const lv_img_dsc_t* planeDirections[4] = {
-        &img_plane,   // Indeks 0: Północ (kursy wokół 0° / 360°)
-        &img_plane1,  // Indeks 1: Wschód (kursy wokół 90°)
-        &img_plane2,  // Indeks 2: Południe (kursy wokół 180°)
-        &img_plane3   // Indeks 3: Zachód (kursy wokół 270°)
+    // Tablica 8 wskaźników na struktury LVGL
+    const lv_img_dsc_t* planeDirections[8] = {
+        &img_plane,      // Indeks 0: 338° do 22°    (Północ)
+        &img_plane45,    // Indeks 1: 23° do 67°     (Północny-Wschód)
+        &img_plane90,    // Indeks 2: 68° do 112°    (Wschód)
+        &img_plane135,   // Indeks 3: 113° do 157°   (Południowy-Wschód)
+        &img_plane180,   // Indeks 4: 158° do 202°   (Południe)
+        &img_plane225,   // Indeks 5: 203° do 247°   (Południowy-Zachód)
+        &img_plane270,   // Indeks 6: 248° do 292°   (Zachód)
+        &img_plane315    // Indeks 7: 293° do 337°   (Północny-Zachód)
     };
 
     // Odczyt danych z tablicy globalnej pod osłoną TYLKO JEDNEGO Mutexu
@@ -452,19 +457,18 @@ void updateFlightRadarUI() {
                 lv_obj_t* planeImage = planeImages[m];
 
                 if (planeImage != NULL) {
-                    // Pobieramy surową wartość kursu (0.0 - 360.0)
-                    float rawTrack = (float)trackedPlanesList[m].track;
+                    // POPRAWA: Pobieramy kurs jako liczbę całkowitą (dokładność 1 stopnia)
+                    int rawTrack = (int)trackedPlanesList[m].track;
 
-                    // Normalizacja kołowa kąta dla 100% bezpieczeństwa matematycznego
-                    while (rawTrack < 0.0f) rawTrack += 360.0f;
-                    while (rawTrack >= 360.0f) rawTrack -= 360.0f;
+                    // Pełna kołowa normalizacja kąta na liczbach całkowitych
+                    while (rawTrack < 0) rawTrack += 360;
+                    while (rawTrack >= 360) rawTrack -= 360;
 
-                    // MAPOWANIE KĄTA NA 4 STREFY (Dodajemy 45 stopni przesunięcia i dzielimy przez 90)
-                    // Dzięki temu Północ (Index 0) złapie idealnie zakres od 315.0° do 45.0°
-                    int dirIndex = (int)((rawTrack + 45.0f) / 90.0f);
+                    // POPRAWA: Przesunięcie o 22 stopnie (zamiast 22.5) i dzielenie przez 45 stopni
+                    int dirIndex = (rawTrack + 22) / 45;
                     
-                    // Jeśli po zaokrągleniu wyjdzie indeks 4, oznacza to powrót na północ (360° -> indeks 0)
-                    if (dirIndex >= 4) {
+                    // Zabezpieczenie przed wyjściem poza rozmiar tablicy (np. dla 338°: (338+22)/45 = 8)
+                    if (dirIndex >= 8) {
                         dirIndex = 0;
                     }
 
@@ -482,7 +486,7 @@ void updateFlightRadarUI() {
                 lv_obj_clear_flag(planeButtons[m], LV_OBJ_FLAG_HIDDEN);
             } else {
                 // Ukrycie całego przycisku, gdy samolot znika z radaru
-                lv_obj_add_flag(planeButtons[m], LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(planeButtons[m], LV_FLAG_HIDDEN);
             }
         }
         // Oddanie Mutexu po zakończeniu całej operacji
